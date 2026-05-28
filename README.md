@@ -47,3 +47,14 @@ $sites = @(
 - Lancer en premier avec `-WhatIf` pour valider le plan.
 - Vérifier que VMware Tools est présent pour l'arrêt invité.
 - Adapter la partie updates (WSUS/SCCM/Ansible/Invoke-VMScript) selon votre SI.
+
+
+## Actions de PSCHECK incluses
+
+Le script ajoute des **actions de PSCHECK** avant les opérations destructives :
+
+- vérification existence template/cluster/datastore/folder source,
+- vérification accessibilité/création du dossier d'export,
+- test de connexion à chaque vCenter distant.
+
+Chaque check loggue `[PSCHECK]`, `[PSCHECK:OK]` ou échoue en `[PSCHECK:KO]` pour stopper le workflow proprement.

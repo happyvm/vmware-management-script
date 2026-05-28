@@ -94,6 +94,52 @@ function Wait-VMToPowerOff {
     return $false
 }
 
+
+function Invoke-PSCheck {
+    param(
+        [string]$Name,
+        [scriptblock]$Check
+    )
+
+    Write-Host "[PSCHECK] $Name" -ForegroundColor Yellow
+    try {
+        & $Check
+        Write-Host "[PSCHECK:OK] $Name" -ForegroundColor Green
+    }
+    catch {
+        throw "[PSCHECK:KO] $Name -> $($_.Exception.Message)"
+    }
+}
+
+function Invoke-PreFlightPSChecks {
+    param(
+        [string]$VCenter,
+        [string]$TemplateName,
+        [string]$ClusterName,
+        [string]$DatastoreName,
+        [string]$FolderName,
+        [array]$Sites,
+        [string]$ExportPath
+    )
+
+    Invoke-PSCheck -Name 'Template source existe' -Check { Get-Template -Name $TemplateName | Out-Null }
+    Invoke-PSCheck -Name 'Cluster source existe' -Check { Get-Cluster -Name $ClusterName | Out-Null }
+    Invoke-PSCheck -Name 'Datastore source existe' -Check { Get-Datastore -Name $DatastoreName | Out-Null }
+    Invoke-PSCheck -Name 'Folder source existe' -Check { Get-Folder -Name $FolderName | Out-Null }
+    Invoke-PSCheck -Name 'Dossier export accessible/creable' -Check {
+        if (-not (Test-Path -Path $ExportPath)) {
+            New-Item -Path $ExportPath -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    foreach ($site in $Sites) {
+        Invoke-PSCheck -Name "Site $($site.Name): connexion vCenter" -Check {
+            $remoteConn = if ($Credential) { Connect-VIServer -Server $site.VCenter -Credential $Credential } else { Connect-VIServer -Server $site.VCenter }
+            Disconnect-VIServer -Server $remoteConn -Confirm:$false | Out-Null
+        }
+    }
+}
+
 function Assert-RequiredSiteFields {
     param([array]$Sites)
 
@@ -128,6 +174,8 @@ try {
     }
 
     Connect-ToVCenter -Server $SourceVCenter -Cred $Credential | Out-Null
+
+    Invoke-PreFlightPSChecks -VCenter $SourceVCenter -TemplateName $SourceTemplateName -ClusterName $SourceCluster -DatastoreName $SourceDatastore -FolderName $SourceFolder -Sites $RemoteSites -ExportPath $ExportOvfPath
 
     $sourceTemplate = Get-Template -Name $SourceTemplateName
     $targetCluster = Get-Cluster -Name $SourceCluster
