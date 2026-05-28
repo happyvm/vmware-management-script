@@ -10,6 +10,7 @@
   "BootWaitSeconds": 120,
   "ShutdownTimeoutSeconds": 300,
   "PauseForManualUpdates": true,
+  "MaxParallelSites": 4,
   "RemoteSites": [
     {
       "Name": "Lyon",

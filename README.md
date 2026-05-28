@@ -32,6 +32,21 @@ Le script exécute des PSCHECK avant opérations critiques :
 
 Chaque check loggue `[PSCHECK]`, `[PSCHECK:OK]` ou échoue en `[PSCHECK:KO]`.
 
+## Déploiement multi-sites parallèle
+
+Le déploiement de l'OVA et la templatisation sur les sites distants sont
+parallélisés sur **PowerShell 7+** (`ForEach-Object -Parallel`). Chaque site
+s'exécute dans un runspace isolé (import PowerCLI + connexion vCenter dédiés),
+ce qui évite toute ambiguïté de contexte multi-vCenter.
+
+- `MaxParallelSites` (config JSON) limite le nombre de sites traités en
+  parallèle (défaut : `4`). À ajuster selon la bande passante WAN disponible,
+  car l'OVA est téléversé vers chaque site depuis la source.
+- Sur Windows PowerShell 5.1, le script bascule automatiquement en
+  déploiement séquentiel.
+- Un échec sur un site n'interrompt pas les autres : tous les sites sont
+  tentés, puis le script échoue en listant les sites en erreur.
+
 ## Conseils d'exécution
 
 - Lancer en premier avec `-WhatIf` pour valider le plan.

@@ -13,13 +13,16 @@ Workflow implémenté (cohérent avec le besoin métier):
 7. Arrêt propre puis arrêt forcé si nécessaire.
 8. Renommage de la VM patchée en nom générique du template cible.
 9. Export en OVA.
-10. Déploiement de l'OVA sur chaque site distant.
+10. Déploiement de l'OVA sur chaque site distant (en parallèle sur PowerShell 7+).
 11. Conversion en template sur chaque site distant.
 12. Conversion finale en template sur le site source.
 
 .NOTES
 - Script prévu pour VMware PowerCLI.
 - Exécuter d'abord avec -WhatIf pour validation.
+- Le déploiement multi-sites est parallélisé via ForEach-Object -Parallel sur
+  PowerShell 7+ (throttle configurable via MaxParallelSites); repli séquentiel
+  automatique sur Windows PowerShell 5.1.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -52,6 +55,7 @@ function Import-WorkflowConfig {
     if (-not $cfg.PSObject.Properties.Name.Contains('BootWaitSeconds')) { $cfg | Add-Member -NotePropertyName BootWaitSeconds -NotePropertyValue 120 }
     if (-not $cfg.PSObject.Properties.Name.Contains('ShutdownTimeoutSeconds')) { $cfg | Add-Member -NotePropertyName ShutdownTimeoutSeconds -NotePropertyValue 300 }
     if (-not $cfg.PSObject.Properties.Name.Contains('PauseForManualUpdates')) { $cfg | Add-Member -NotePropertyName PauseForManualUpdates -NotePropertyValue $false }
+    if (-not $cfg.PSObject.Properties.Name.Contains('MaxParallelSites')) { $cfg | Add-Member -NotePropertyName MaxParallelSites -NotePropertyValue 4 }
 
     return $cfg
 }
@@ -136,7 +140,7 @@ function Assert-RequiredSiteFields {
     $required = @('Name', 'VCenter', 'Cluster', 'Datastore', 'Folder')
     foreach ($site in $Sites) {
         foreach ($field in $required) {
-            if (-not $site.ContainsKey($field) -or [string]::IsNullOrWhiteSpace($site[$field])) {
+            if (-not $site.PSObject.Properties.Name.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$site.$field)) {
                 throw "RemoteSites invalide: champ '$field' manquant ou vide pour l'entrée '$($site | Out-String)'."
             }
         }
@@ -164,12 +168,14 @@ try {
     $BootWaitSeconds = [int]$config.BootWaitSeconds
     $ShutdownTimeoutSeconds = [int]$config.ShutdownTimeoutSeconds
     $PauseForManualUpdates = [bool]$config.PauseForManualUpdates
+    $MaxParallelSites = [int]$config.MaxParallelSites
 
     Assert-RequiredSiteFields -Sites $RemoteSites
 
     $dateSuffix = Get-Date -Format 'MM-yyyy'
     $archivedTemplateName = "$SourceTemplateName-$dateSuffix"
-    $ovaFilePath = Join-Path $ExportOvfPath "$GenericTemplateName.ova"
+    # Export-VApp -Format Ova crée un sous-dossier portant le nom de la VM: <Dest>\<Nom>\<Nom>.ova
+    $ovaFilePath = Join-Path (Join-Path $ExportOvfPath $GenericTemplateName) "$GenericTemplateName.ova"
 
     if (-not (Test-Path -Path $ExportOvfPath)) {
         if ($PSCmdlet.ShouldProcess($ExportOvfPath, 'Créer le dossier d export')) {
@@ -177,21 +183,22 @@ try {
         }
     }
 
-    Connect-ToVCenter -Server $SourceVCenter -Cred $Credential | Out-Null
+    $sourceConn = Connect-ToVCenter -Server $SourceVCenter -Cred $Credential
 
     Invoke-PreFlightPSChecks -VCenter $SourceVCenter -TemplateName $SourceTemplateName -ClusterName $SourceCluster -DatastoreName $SourceDatastore -FolderName $SourceFolder -Sites $RemoteSites -ExportPath $ExportOvfPath
 
-    $sourceTemplate = Get-Template -Name $SourceTemplateName
-    $targetCluster = Get-Cluster -Name $SourceCluster
-    $targetDatastore = Get-Datastore -Name $SourceDatastore
-    $targetFolder = Get-Folder -Name $SourceFolder
-    $targetHost = $targetCluster | Get-VMHost | Sort-Object CpuUsageMhz | Select-Object -First 1
+    $sourceTemplate = Get-Template -Name $SourceTemplateName -Server $sourceConn
+    $targetCluster = Get-Cluster -Name $SourceCluster -Server $sourceConn
+    $targetDatastore = Get-Datastore -Name $SourceDatastore -Server $sourceConn
+    $targetFolder = Get-Folder -Name $SourceFolder -Server $sourceConn
+    $targetHost = $targetCluster | Get-VMHost -Server $sourceConn | Sort-Object CpuUsageMhz | Select-Object -First 1
 
     if ($PSCmdlet.ShouldProcess($SourceTemplateName, 'Convertir le template en VM')) {
         $workingVm = Set-Template -Template $sourceTemplate -ToVM -VMHost $targetHost -Datastore $targetDatastore
     }
     else {
-        $workingVm = Get-VM -Name $SourceTemplateName
+        Write-Host '[WhatIf] Conversion simulée; planification basée sur le template source.' -ForegroundColor DarkGray
+        $workingVm = $sourceTemplate
     }
 
     if ($workingVm.Name -ne $WorkingVmName -and $PSCmdlet.ShouldProcess($workingVm.Name, "Renommer en $WorkingVmName")) {
@@ -205,13 +212,14 @@ try {
 
     if ($PSCmdlet.ShouldProcess($workingVm.Name, 'Démarrer la VM de travail')) {
         Start-VM -VM $workingVm -Confirm:$false | Out-Null
+        Write-Host "Attente du démarrage ($BootWaitSeconds s)..." -ForegroundColor Cyan
+        Start-Sleep -Seconds $BootWaitSeconds
     }
-    Start-Sleep -Seconds $BootWaitSeconds
 
-    if ($PauseForManualUpdates -eq $true) {
+    if ($PauseForManualUpdates -eq $true -and -not $WhatIfPreference) {
         Read-Host "Effectuez les updates dans la VM $($workingVm.Name), puis appuyez sur Entrée"
     }
-    else {
+    elseif (-not $PauseForManualUpdates) {
         Write-Warning "Ajoutez votre mécanisme d'updates (Invoke-VMScript, WSUS, SCCM, Ansible, etc.)."
     }
 
@@ -232,28 +240,113 @@ try {
         Export-VApp -VM $workingVm -Destination $ExportOvfPath -Format Ova -Force | Out-Null
     }
 
+    # --- Déploiement multi-sites ---
+    # La décision ShouldProcess (et donc le mode -WhatIf) est évaluée ici, dans le runspace
+    # principal: $PSCmdlet n'est pas accessible depuis les runspaces de ForEach-Object -Parallel.
+    $sitesToDeploy = @()
     foreach ($site in $RemoteSites) {
-        Connect-ToVCenter -Server $site.VCenter -Cred $Credential | Out-Null
-        try {
-            $deployedVmName = "$GenericTemplateName-$($site.Name)"
-            $siteCluster = Get-Cluster -Name $site.Cluster
-            $siteHost = $siteCluster | Get-VMHost | Sort-Object CpuUsageMhz | Select-Object -First 1
-            $siteDatastore = Get-Datastore -Name $site.Datastore
-            $siteFolder = Get-Folder -Name $site.Folder
-
-            if ($PSCmdlet.ShouldProcess($site.Name, "Importer $ovaFilePath et templatiser")) {
-                $deployedVm = Import-VApp -Source $ovaFilePath -Name $deployedVmName -VMHost $siteHost -Datastore $siteDatastore -Location $siteFolder
-                Set-VM -VM $deployedVm -ToTemplate -Confirm:$false | Out-Null
-            }
-        }
-        finally {
-            Disconnect-VIServer -Server $site.VCenter -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        if ($PSCmdlet.ShouldProcess($site.Name, "Importer $ovaFilePath et templatiser")) {
+            $sitesToDeploy += $site
         }
     }
 
-    Connect-ToVCenter -Server $SourceVCenter -Cred $Credential | Out-Null
-    $sourceVmToTemplate = Get-VM -Name $GenericTemplateName
-    if ($PSCmdlet.ShouldProcess($sourceVmToTemplate.Name, 'Convertir la VM source en template')) {
+    if ($sitesToDeploy.Count -gt 0) {
+        if (-not (Test-Path -Path $ovaFilePath)) {
+            throw "OVA introuvable: $ovaFilePath"
+        }
+
+        $throttle = if ($MaxParallelSites -gt 0) { $MaxParallelSites } else { 4 }
+
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            Write-Host "Déploiement parallèle sur $($sitesToDeploy.Count) site(s) (throttle=$throttle)..." -ForegroundColor Cyan
+            # Chaque site tourne dans un runspace isolé: import PowerCLI + connexion dédiés,
+            # ce qui évite toute ambiguïté de contexte multi-vCenter.
+            $siteResults = $sitesToDeploy | ForEach-Object -ThrottleLimit $throttle -Parallel {
+                $site        = $_
+                $ova         = $using:ovaFilePath
+                $cred        = $using:Credential
+                $genericName = $using:GenericTemplateName
+
+                $result = [pscustomobject]@{ Site = $site.Name; Success = $false; Message = $null }
+                $conn = $null
+                try {
+                    Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+                    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false | Out-Null
+
+                    $conn = if ($cred) {
+                        Connect-VIServer -Server $site.VCenter -Credential $cred -ErrorAction Stop
+                    }
+                    else {
+                        Connect-VIServer -Server $site.VCenter -ErrorAction Stop
+                    }
+
+                    $deployedVmName = "$genericName-$($site.Name)"
+                    $siteCluster    = Get-Cluster   -Name $site.Cluster   -Server $conn -ErrorAction Stop
+                    $siteHost       = $siteCluster | Get-VMHost -Server $conn | Sort-Object CpuUsageMhz | Select-Object -First 1
+                    $siteDatastore  = Get-Datastore -Name $site.Datastore -Server $conn -ErrorAction Stop
+                    $siteFolder     = Get-Folder    -Name $site.Folder    -Server $conn -ErrorAction Stop
+
+                    $deployedVm = Import-VApp -Source $ova -Name $deployedVmName -VMHost $siteHost -Datastore $siteDatastore -Location $siteFolder -Server $conn -ErrorAction Stop
+                    Set-VM -VM $deployedVm -ToTemplate -Confirm:$false -ErrorAction Stop | Out-Null
+
+                    $result.Success = $true
+                    $result.Message = "Template '$deployedVmName' déployé."
+                }
+                catch {
+                    $result.Message = $_.Exception.Message
+                }
+                finally {
+                    if ($conn) { Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
+                }
+                $result
+            }
+        }
+        else {
+            Write-Warning "PowerShell < 7 détecté: déploiement séquentiel (parallélisme indisponible)."
+            $siteResults = foreach ($site in $sitesToDeploy) {
+                $result = [pscustomobject]@{ Site = $site.Name; Success = $false; Message = $null }
+                $conn = $null
+                try {
+                    $conn = Connect-ToVCenter -Server $site.VCenter -Cred $Credential
+                    $deployedVmName = "$GenericTemplateName-$($site.Name)"
+                    $siteCluster    = Get-Cluster   -Name $site.Cluster   -Server $conn
+                    $siteHost       = $siteCluster | Get-VMHost -Server $conn | Sort-Object CpuUsageMhz | Select-Object -First 1
+                    $siteDatastore  = Get-Datastore -Name $site.Datastore -Server $conn
+                    $siteFolder     = Get-Folder    -Name $site.Folder    -Server $conn
+
+                    $deployedVm = Import-VApp -Source $ovaFilePath -Name $deployedVmName -VMHost $siteHost -Datastore $siteDatastore -Location $siteFolder -Server $conn
+                    Set-VM -VM $deployedVm -ToTemplate -Confirm:$false | Out-Null
+
+                    $result.Success = $true
+                    $result.Message = "Template '$deployedVmName' déployé."
+                }
+                catch {
+                    $result.Message = $_.Exception.Message
+                }
+                finally {
+                    if ($conn) { Disconnect-VIServer -Server $conn -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
+                }
+                $result
+            }
+        }
+
+        foreach ($r in $siteResults) {
+            if ($r.Success) {
+                Write-Host "[SITE:OK] $($r.Site) - $($r.Message)" -ForegroundColor Green
+            }
+            else {
+                Write-Warning "[SITE:KO] $($r.Site) - $($r.Message)"
+            }
+        }
+
+        $failedSites = @($siteResults | Where-Object { -not $_.Success })
+        if ($failedSites.Count -gt 0) {
+            throw "Déploiement échoué sur $($failedSites.Count) site(s): $(($failedSites | ForEach-Object { $_.Site }) -join ', ')."
+        }
+    }
+
+    if ($PSCmdlet.ShouldProcess($GenericTemplateName, 'Convertir la VM source en template')) {
+        $sourceVmToTemplate = Get-VM -Name $GenericTemplateName -Server $sourceConn
         Set-VM -VM $sourceVmToTemplate -ToTemplate -Confirm:$false | Out-Null
     }
 
