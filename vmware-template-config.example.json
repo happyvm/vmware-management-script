@@ -1,0 +1,29 @@
+{
+  "SourceVCenter": "vc-source.local",
+  "SourceTemplateName": "win2022-template",
+  "WorkingVmName": "win2022-patching",
+  "GenericTemplateName": "win2022-template",
+  "SourceCluster": "Cluster-Source",
+  "SourceDatastore": "DS-Source-01",
+  "SourceFolder": "Templates",
+  "ExportOvfPath": "D:\\Exports",
+  "BootWaitSeconds": 120,
+  "ShutdownTimeoutSeconds": 300,
+  "PauseForManualUpdates": true,
+  "RemoteSites": [
+    {
+      "Name": "Lyon",
+      "VCenter": "vc-lyon.local",
+      "Cluster": "Cluster-Lyon",
+      "Datastore": "DS-Lyon-01",
+      "Folder": "Templates"
+    },
+    {
+      "Name": "Paris",
+      "VCenter": "vc-paris.local",
+      "Cluster": "Cluster-Paris",
+      "Datastore": "DS-Paris-01",
+      "Folder": "Templates"
+    }
+  ]
+}

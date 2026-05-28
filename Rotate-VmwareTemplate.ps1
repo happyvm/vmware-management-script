@@ -25,46 +25,36 @@ Workflow implémenté (cohérent avec le besoin métier):
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$SourceVCenter,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SourceTemplateName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$WorkingVmName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$GenericTemplateName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SourceCluster,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SourceDatastore,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SourceFolder,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ExportOvfPath,
-
-    [Parameter(Mandatory = $true)]
-    [array]$RemoteSites,
+    [string]$ConfigPath,
 
     [Parameter()]
-    [pscredential]$Credential,
-
-    [Parameter()]
-    [int]$BootWaitSeconds = 120,
-
-    [Parameter()]
-    [int]$ShutdownTimeoutSeconds = 300,
-
-    [Parameter()]
-    [switch]$PauseForManualUpdates
+    [pscredential]$Credential
 )
 
 $ErrorActionPreference = 'Stop'
+
+
+function Import-WorkflowConfig {
+    param([string]$Path)
+
+    if (-not (Test-Path -Path $Path)) {
+        throw "Fichier de configuration introuvable: $Path"
+    }
+
+    $cfg = Get-Content -Path $Path -Raw | ConvertFrom-Json
+    $required = @('SourceVCenter','SourceTemplateName','WorkingVmName','GenericTemplateName','SourceCluster','SourceDatastore','SourceFolder','ExportOvfPath','RemoteSites')
+    foreach ($field in $required) {
+        if (-not $cfg.PSObject.Properties.Name.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$cfg.$field)) {
+            throw "Champ obligatoire manquant dans le fichier de configuration: $field"
+        }
+    }
+
+    if (-not $cfg.PSObject.Properties.Name.Contains('BootWaitSeconds')) { $cfg | Add-Member -NotePropertyName BootWaitSeconds -NotePropertyValue 120 }
+    if (-not $cfg.PSObject.Properties.Name.Contains('ShutdownTimeoutSeconds')) { $cfg | Add-Member -NotePropertyName ShutdownTimeoutSeconds -NotePropertyValue 300 }
+    if (-not $cfg.PSObject.Properties.Name.Contains('PauseForManualUpdates')) { $cfg | Add-Member -NotePropertyName PauseForManualUpdates -NotePropertyValue $false }
+
+    return $cfg
+}
 
 function Connect-ToVCenter {
     param([string]$Server, [pscredential]$Cred)
@@ -161,6 +151,20 @@ try {
     Import-Module VMware.PowerCLI -ErrorAction Stop
     Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false | Out-Null
 
+    $config = Import-WorkflowConfig -Path $ConfigPath
+    $SourceVCenter = $config.SourceVCenter
+    $SourceTemplateName = $config.SourceTemplateName
+    $WorkingVmName = $config.WorkingVmName
+    $GenericTemplateName = $config.GenericTemplateName
+    $SourceCluster = $config.SourceCluster
+    $SourceDatastore = $config.SourceDatastore
+    $SourceFolder = $config.SourceFolder
+    $ExportOvfPath = $config.ExportOvfPath
+    $RemoteSites = @($config.RemoteSites)
+    $BootWaitSeconds = [int]$config.BootWaitSeconds
+    $ShutdownTimeoutSeconds = [int]$config.ShutdownTimeoutSeconds
+    $PauseForManualUpdates = [bool]$config.PauseForManualUpdates
+
     Assert-RequiredSiteFields -Sites $RemoteSites
 
     $dateSuffix = Get-Date -Format 'MM-yyyy'
@@ -204,7 +208,7 @@ try {
     }
     Start-Sleep -Seconds $BootWaitSeconds
 
-    if ($PauseForManualUpdates) {
+    if ($PauseForManualUpdates -eq $true) {
         Read-Host "Effectuez les updates dans la VM $($workingVm.Name), puis appuyez sur Entrée"
     }
     else {
